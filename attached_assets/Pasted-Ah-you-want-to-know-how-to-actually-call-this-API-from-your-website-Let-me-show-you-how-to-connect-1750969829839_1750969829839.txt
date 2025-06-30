@@ -1,0 +1,115 @@
+Ah, you want to know how to actually call this API from your website! Let me show you how to connect your frontend to the Claude API you just set up.
+
+Here's how to call your /api/chat endpoint from your website:
+
+## 🔥 Basic Example:
+// Send a message to your AI
+const response = await fetch('/api/chat', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    message: "Help me build a todo app",
+    conversationHistory: [] // Empty for first message
+  })
+});
+
+const data = await response.json();
+console.log(data.message); // Claude's response
+💬 With Conversation History:
+// Keep track of the conversation
+let conversation = [];
+
+async function sendMessage(userMessage) {
+  const response = await fetch('/api/chat', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      message: userMessage,
+      conversationHistory: conversation
+    })
+  });
+
+  const data = await response.json();
+  
+  if (data.success) {
+    // Add both messages to conversation
+    conversation.push({ role: 'user', content: userMessage });
+    conversation.push({ role: 'assistant', content: data.message });
+    
+    return data.message;
+  } else {
+    console.error(data.error);
+  }
+🎯 In a React Component:
+function ChatBot() {
+
+  const sendMessage = async () => {
+    if (!input.trim()) return;
+    
+    setLoading(true);
+    const userMessage = input;
+    setInput('');
+    
+    // Add user message immediately
+    setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
+    
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: userMessage,
+          conversationHistory: messages
+        })
+      });
+      
+      const data = await response.json();
+      
+      if (data.success) {
+        setMessages(prev => [...prev, { role: 'assistant', content: data.message }]);
+      }
+    } catch (error) {
+      console.error('Error:', error);
+    }
+    
+    setLoading(false);
+  };
+
+  return (
+    <div>
+      {/* Chat messages */}
+      <div>
+        {messages.map((msg, i) => (
+          <div key={i}>
+            <strong>{msg.role}:</strong> {msg.content}
+          </div>
+        ))}
+      </div>
+      
+      {/* Input */}
+      <input 
+        value={input}
+        onChange={(e) => setInput(e.target.value)}
+        onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
+      />
+      <button onClick={sendMessage} disabled={loading}>
+        {loading ? 'Sending...' : 'Send'}
+      </button>
+    </div>
+  );
+}
+📝 The API Expects:
+
+- message (required): The user's question/message
+- conversationHistory (optional): Array of previous messages
+
+## 📤 The API Returns:
+
+- success: true/false
+- message: Claude's response
+- files: Any generated code files
+- error: Error message if something went wrong

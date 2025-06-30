@@ -1,0 +1,780 @@
+/**
+ * DATABASE-FIRST USER MANAGEMENT SYSTEM
+ * Complete database schema and management for user authentication
+ */
+
+import type { Express, Request, Response, NextFunction } from "express";
+import session from "express-session";
+import connectPg from "connect-pg-simple";
+import { nanoid } from "nanoid";
+import { db } from "./server/db";
+import { 
+  users, 
+  userSessions, 
+  userProfiles, 
+  loginAttempts, 
+  userRoles,
+  userPermissions,
+  activityLogs,
+  passwordResets,
+  emailVerifications,
+  type User,
+  type UserSession,
+  type UserProfile,
+  type LoginAttempt,
+  type ActivityLog
+} from "./server/schema";
+import { eq, and, gt, lt, desc, count, sql } from "drizzle-orm";
+import bcrypt from "bcrypt";
+import rateLimit from "express-rate-limit";
+import helmet from "helmet";
+import { z } from "zod";
+
+// ===========================================
+// DATABASE SCHEMA DEFINITIONS
+// ===========================================
+
+// Enhanced schema with proper relationships and indexes
+export const databaseSchema = {
+  // Core users table
+  users: {
+    id: 'VARCHAR(32) PRIMARY KEY',
+    email: 'VARCHAR(254) UNIQUE NOT NULL',
+    passwordHash: 'VARCHAR(255) NOT NULL',
+    emailVerified: 'BOOLEAN DEFAULT FALSE',
+    isActive: 'BOOLEAN DEFAULT TRUE',
+    createdAt: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+    updatedAt: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+    lastLoginAt: 'TIMESTAMP',
+    loginCount: 'INTEGER DEFAULT 0',
+    failedLoginAttempts: 'INTEGER DEFAULT 0',
+    lockedUntil: 'TIMESTAMP NULL',
+    
+    // Indexes
+    indexes: [
+      'CREATE INDEX idx_users_email ON users(email)',
+      'CREATE INDEX idx_users_active ON users(isActive)',
+      'CREATE INDEX idx_users_verified ON users(emailVerified)',
+      'CREATE INDEX idx_users_created ON users(createdAt)'
+    ]
+  },
+
+  // User profiles (separate for normalization)
+  userProfiles: {
+    id: 'VARCHAR(32) PRIMARY KEY',
+    userId: 'VARCHAR(32) REFERENCES users(id) ON DELETE CASCADE',
+    firstName: 'VARCHAR(100)',
+    lastName: 'VARCHAR(100)',
+    displayName: 'VARCHAR(200)',
+    avatar: 'TEXT',
+    bio: 'TEXT',
+    timezone: 'VARCHAR(50)',
+    language: 'VARCHAR(10) DEFAULT \'en\'',
+    theme: 'VARCHAR(20) DEFAULT \'light\'',
+    createdAt: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+    updatedAt: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+    
+    // Indexes
+    indexes: [
+      'CREATE UNIQUE INDEX idx_profiles_user ON userProfiles(userId)',
+      'CREATE INDEX idx_profiles_display_name ON userProfiles(displayName)'
+    ]
+  },
+
+  // Session management
+  userSessions: {
+    id: 'VARCHAR(64) PRIMARY KEY',
+    userId: 'VARCHAR(32) REFERENCES users(id) ON DELETE CASCADE',
+    deviceFingerprint: 'VARCHAR(64)',
+    ipAddressHash: 'VARCHAR(64)',
+    userAgent: 'TEXT',
+    isValid: 'BOOLEAN DEFAULT TRUE',
+    createdAt: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+    lastActivity: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+    expiresAt: 'TIMESTAMP NOT NULL',
+    
+    // Indexes
+    indexes: [
+      'CREATE INDEX idx_sessions_user ON userSessions(userId)',
+      'CREATE INDEX idx_sessions_valid ON userSessions(isValid)',
+      'CREATE INDEX idx_sessions_expires ON userSessions(expiresAt)',
+      'CREATE INDEX idx_sessions_activity ON userSessions(lastActivity)'
+    ]
+  },
+
+  // Login attempt tracking
+  loginAttempts: {
+    id: 'VARCHAR(32) PRIMARY KEY',
+    email: 'VARCHAR(254)',
+    ipAddressHash: 'VARCHAR(64)',
+    success: 'BOOLEAN',
+    attemptedAt: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+    userAgent: 'TEXT',
+    failureReason: 'VARCHAR(100)',
+    
+    // Indexes
+    indexes: [
+      'CREATE INDEX idx_login_attempts_email ON loginAttempts(email)',
+      'CREATE INDEX idx_login_attempts_ip ON loginAttempts(ipAddressHash)',
+      'CREATE INDEX idx_login_attempts_time ON loginAttempts(attemptedAt)',
+      'CREATE INDEX idx_login_attempts_success ON loginAttempts(success)'
+    ]
+  },
+
+  // Role-based access control
+  userRoles: {
+    id: 'VARCHAR(32) PRIMARY KEY',
+    name: 'VARCHAR(50) UNIQUE NOT NULL',
+    description: 'TEXT',
+    isActive: 'BOOLEAN DEFAULT TRUE',
+    createdAt: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+    
+    // Indexes
+    indexes: [
+      'CREATE INDEX idx_roles_name ON userRoles(name)',
+      'CREATE INDEX idx_roles_active ON userRoles(isActive)'
+    ]
+  },
+
+  userPermissions: {
+    id: 'VARCHAR(32) PRIMARY KEY',
+    userId: 'VARCHAR(32) REFERENCES users(id) ON DELETE CASCADE',
+    roleId: 'VARCHAR(32) REFERENCES userRoles(id) ON DELETE CASCADE',
+    grantedAt: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+    grantedBy: 'VARCHAR(32) REFERENCES users(id)',
+    
+    // Indexes
+    indexes: [
+      'CREATE UNIQUE INDEX idx_user_role ON userPermissions(userId, roleId)',
+      'CREATE INDEX idx_permissions_user ON userPermissions(userId)',
+      'CREATE INDEX idx_permissions_role ON userPermissions(roleId)'
+    ]
+  },
+
+  // Activity logging
+  activityLogs: {
+    id: 'VARCHAR(32) PRIMARY KEY',
+    userId: 'VARCHAR(32) REFERENCES users(id) ON DELETE CASCADE',
+    sessionId: 'VARCHAR(64) REFERENCES userSessions(id) ON DELETE SET NULL',
+    action: 'VARCHAR(100) NOT NULL',
+    resource: 'VARCHAR(100)',
+    ipAddressHash: 'VARCHAR(64)',
+    userAgent: 'TEXT',
+    metadata: 'JSONB',
+    success: 'BOOLEAN DEFAULT TRUE',
+    createdAt: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+    
+    // Indexes
+    indexes: [
+      'CREATE INDEX idx_activity_user ON activityLogs(userId)',
+      'CREATE INDEX idx_activity_session ON activityLogs(sessionId)',
+      'CREATE INDEX idx_activity_action ON activityLogs(action)',
+      'CREATE INDEX idx_activity_time ON activityLogs(createdAt)',
+      'CREATE INDEX idx_activity_success ON activityLogs(success)'
+    ]
+  },
+
+  // Password reset tokens
+  passwordResets: {
+    id: 'VARCHAR(32) PRIMARY KEY',
+    userId: 'VARCHAR(32) REFERENCES users(id) ON DELETE CASCADE',
+    token: 'VARCHAR(255) UNIQUE NOT NULL',
+    expiresAt: 'TIMESTAMP NOT NULL',
+    used: 'BOOLEAN DEFAULT FALSE',
+    createdAt: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+    
+    // Indexes
+    indexes: [
+      'CREATE INDEX idx_password_resets_user ON passwordResets(userId)',
+      'CREATE INDEX idx_password_resets_token ON passwordResets(token)',
+      'CREATE INDEX idx_password_resets_expires ON passwordResets(expiresAt)'
+    ]
+  },
+
+  // Email verification
+  emailVerifications: {
+    id: 'VARCHAR(32) PRIMARY KEY',
+    userId: 'VARCHAR(32) REFERENCES users(id) ON DELETE CASCADE',
+    email: 'VARCHAR(254) NOT NULL',
+    token: 'VARCHAR(255) UNIQUE NOT NULL',
+    expiresAt: 'TIMESTAMP NOT NULL',
+    verified: 'BOOLEAN DEFAULT FALSE',
+    createdAt: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+    
+    // Indexes
+    indexes: [
+      'CREATE INDEX idx_email_verifications_user ON emailVerifications(userId)',
+      'CREATE INDEX idx_email_verifications_token ON emailVerifications(token)',
+      'CREATE INDEX idx_email_verifications_expires ON emailVerifications(expiresAt)'
+    ]
+  }
+};
+
+// ===========================================
+// VALIDATION SCHEMAS
+// ===========================================
+
+const registerSchema = z.object({
+  firstName: z.string().min(1).max(100),
+  lastName: z.string().min(1).max(100),
+  email: z.string().email().max(254),
+  password: z.string().min(8).max(128)
+    .regex(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]/, 
+           'Password must contain uppercase, lowercase, number, and special character')
+});
+
+const loginSchema = z.object({
+  email: z.string().email().max(254),
+  password: z.string().min(1).max(128)
+});
+
+const profileUpdateSchema = z.object({
+  firstName: z.string().min(1).max(100).optional(),
+  lastName: z.string().min(1).max(100).optional(),
+  displayName: z.string().min(1).max(200).optional(),
+  bio: z.string().max(1000).optional(),
+  timezone: z.string().max(50).optional(),
+  language: z.string().max(10).optional(),
+  theme: z.enum(['light', 'dark']).optional()
+});
+
+// ===========================================
+// DATABASE REPOSITORY LAYER
+// ===========================================
+
+export class UserRepository {
+  
+  // User CRUD operations
+  async createUser(userData: {
+    email: string;
+    passwordHash: string;
+    firstName: string;
+    lastName: string;
+  }): Promise<{ user: User; profile: UserProfile }> {
+    const userId = nanoid(16);
+    const profileId = nanoid(16);
+    const now = new Date();
+
+    return await db.transaction(async (tx) => {
+      // Create user
+      const [user] = await tx.insert(users).values({
+        id: userId,
+        email: userData.email.toLowerCase().trim(),
+        passwordHash: userData.passwordHash,
+        createdAt: now,
+        updatedAt: now,
+      }).returning();
+
+      // Create profile
+      const [profile] = await tx.insert(userProfiles).values({
+        id: profileId,
+        userId: userId,
+        firstName: userData.firstName.trim(),
+        lastName: userData.lastName.trim(),
+        displayName: `${userData.firstName} ${userData.lastName}`.trim(),
+        createdAt: now,
+        updatedAt: now,
+      }).returning();
+
+      return { user, profile };
+    });
+  }
+
+  async getUserByEmail(email: string): Promise<(User & { profile: UserProfile }) | null> {
+    const result = await db
+      .select()
+      .from(users)
+      .leftJoin(userProfiles, eq(users.id, userProfiles.userId))
+      .where(and(
+        eq(users.email, email.toLowerCase().trim()),
+        eq(users.isActive, true)
+      ));
+
+    if (!result[0]) return null;
+
+    return {
+      ...result[0].users,
+      profile: result[0].userProfiles!
+    };
+  }
+
+  async getUserById(id: string): Promise<(User & { profile: UserProfile }) | null> {
+    const result = await db
+      .select()
+      .from(users)
+      .leftJoin(userProfiles, eq(users.id, userProfiles.userId))
+      .where(and(
+        eq(users.id, id),
+        eq(users.isActive, true)
+      ));
+
+    if (!result[0]) return null;
+
+    return {
+      ...result[0].users,
+      profile: result[0].userProfiles!
+    };
+  }
+
+  async updateUserLogin(userId: string): Promise<void> {
+    await db
+      .update(users)
+      .set({
+        lastLoginAt: new Date(),
+        loginCount: sql`${users.loginCount} + 1`,
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+        updatedAt: new Date()
+      })
+      .where(eq(users.id, userId));
+  }
+
+  async incrementFailedLoginAttempts(userId: string): Promise<void> {
+    const maxAttempts = 5;
+    const lockoutDuration = 15 * 60 * 1000; // 15 minutes
+
+    await db
+      .update(users)
+      .set({
+        failedLoginAttempts: sql`${users.failedLoginAttempts} + 1`,
+        lockedUntil: sql`CASE 
+          WHEN ${users.failedLoginAttempts} + 1 >= ${maxAttempts} 
+          THEN ${new Date(Date.now() + lockoutDuration)} 
+          ELSE ${users.lockedUntil} 
+        END`,
+        updatedAt: new Date()
+      })
+      .where(eq(users.id, userId));
+  }
+
+  async updateProfile(userId: string, profileData: Partial<UserProfile>): Promise<void> {
+    await db
+      .update(userProfiles)
+      .set({
+        ...profileData,
+        updatedAt: new Date()
+      })
+      .where(eq(userProfiles.userId, userId));
+  }
+
+  // Session management
+  async createSession(sessionData: {
+    userId: string;
+    deviceFingerprint: string;
+    ipAddressHash: string;
+    userAgent: string;
+    expiresAt: Date;
+  }): Promise<UserSession> {
+    const sessionId = nanoid(32);
+    const now = new Date();
+
+    const [session] = await db.insert(userSessions).values({
+      id: sessionId,
+      userId: sessionData.userId,
+      deviceFingerprint: sessionData.deviceFingerprint,
+      ipAddressHash: sessionData.ipAddressHash,
+      userAgent: sessionData.userAgent.slice(0, 500), // Limit length
+      createdAt: now,
+      lastActivity: now,
+      expiresAt: sessionData.expiresAt,
+    }).returning();
+
+    return session;
+  }
+
+  async validateSession(sessionId: string): Promise<UserSession | null> {
+    const [session] = await db
+      .select()
+      .from(userSessions)
+      .where(and(
+        eq(userSessions.id, sessionId),
+        eq(userSessions.isValid, true),
+        gt(userSessions.expiresAt, new Date())
+      ));
+
+    if (!session) return null;
+
+    // Update last activity
+    await db
+      .update(userSessions)
+      .set({ lastActivity: new Date() })
+      .where(eq(userSessions.id, sessionId));
+
+    return session;
+  }
+
+  async invalidateSession(sessionId: string): Promise<void> {
+    await db
+      .update(userSessions)
+      .set({ isValid: false })
+      .where(eq(userSessions.id, sessionId));
+  }
+
+  async invalidateAllUserSessions(userId: string): Promise<void> {
+    await db
+      .update(userSessions)
+      .set({ isValid: false })
+      .where(eq(userSessions.userId, userId));
+  }
+
+  async cleanupExpiredSessions(): Promise<number> {
+    const result = await db
+      .update(userSessions)
+      .set({ isValid: false })
+      .where(and(
+        eq(userSessions.isValid, true),
+        lt(userSessions.expiresAt, new Date())
+      ))
+      .returning({ id: userSessions.id });
+
+    return result.length;
+  }
+
+  // Activity logging
+  async logActivity(activityData: {
+    userId: string;
+    sessionId?: string;
+    action: string;
+    resource?: string;
+    ipAddressHash: string;
+    userAgent: string;
+    metadata?: any;
+    success?: boolean;
+  }): Promise<void> {
+    await db.insert(activityLogs).values({
+      id: nanoid(),
+      ...activityData,
+      createdAt: new Date()
+    });
+  }
+
+  async getUserActivity(userId: string, limit: number = 50): Promise<ActivityLog[]> {
+    return await db
+      .select()
+      .from(activityLogs)
+      .where(eq(activityLogs.userId, userId))
+      .orderBy(desc(activityLogs.createdAt))
+      .limit(limit);
+  }
+
+  async cleanupOldActivityLogs(daysToKeep: number = 90): Promise<number> {
+    const cutoffDate = new Date(Date.now() - daysToKeep * 24 * 60 * 60 * 1000);
+    
+    const result = await db
+      .delete(activityLogs)
+      .where(lt(activityLogs.createdAt, cutoffDate))
+      .returning({ id: activityLogs.id });
+
+    return result.length;
+  }
+
+  // Login attempt tracking
+  async recordLoginAttempt(attemptData: {
+    email: string;
+    ipAddressHash: string;
+    success: boolean;
+    userAgent: string;
+    failureReason?: string;
+  }): Promise<void> {
+    await db.insert(loginAttempts).values({
+      id: nanoid(),
+      ...attemptData,
+      attemptedAt: new Date()
+    });
+  }
+
+  async getRecentLoginAttempts(
+    email: string, 
+    ipHash: string, 
+    windowMinutes: number = 15
+  ): Promise<LoginAttempt[]> {
+    const cutoffTime = new Date(Date.now() - windowMinutes * 60 * 1000);
+    
+    return await db
+      .select()
+      .from(loginAttempts)
+      .where(and(
+        eq(loginAttempts.email, email.toLowerCase()),
+        eq(loginAttempts.ipAddressHash, ipHash),
+        gt(loginAttempts.attemptedAt, cutoffTime)
+      ))
+      .orderBy(desc(loginAttempts.attemptedAt));
+  }
+
+  // Analytics and reporting
+  async getUserStats(): Promise<{
+    totalUsers: number;
+    activeUsers: number;
+    verifiedUsers: number;
+    newUsersToday: number;
+    activeSessions: number;
+  }> {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const [stats] = await db
+      .select({
+        totalUsers: count(users.id),
+        activeUsers: sql<number>`COUNT(CASE WHEN ${users.isActive} THEN 1 END)`,
+        verifiedUsers: sql<number>`COUNT(CASE WHEN ${users.emailVerified} THEN 1 END)`,
+        newUsersToday: sql<number>`COUNT(CASE WHEN ${users.createdAt} >= ${today} THEN 1 END)`,
+      })
+      .from(users);
+
+    const [sessionStats] = await db
+      .select({
+        activeSessions: count(userSessions.id)
+      })
+      .from(userSessions)
+      .where(and(
+        eq(userSessions.isValid, true),
+        gt(userSessions.expiresAt, new Date())
+      ));
+
+    return {
+      ...stats,
+      activeSessions: sessionStats.activeSessions
+    };
+  }
+
+  async getLoginStats(days: number = 30): Promise<{
+    date: string;
+    successful: number;
+    failed: number;
+  }[]> {
+    const cutoffDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    
+    return await db
+      .select({
+        date: sql<string>`DATE(${loginAttempts.attemptedAt})`,
+        successful: sql<number>`COUNT(CASE WHEN ${loginAttempts.success} THEN 1 END)`,
+        failed: sql<number>`COUNT(CASE WHEN NOT ${loginAttempts.success} THEN 1 END)`
+      })
+      .from(loginAttempts)
+      .where(gt(loginAttempts.attemptedAt, cutoffDate))
+      .groupBy(sql`DATE(${loginAttempts.attemptedAt})`)
+      .orderBy(sql`DATE(${loginAttempts.attemptedAt})`);
+  }
+}
+
+// ===========================================
+// DATABASE SERVICE LAYER
+// ===========================================
+
+export class DatabaseUserService {
+  private repository: UserRepository;
+  private readonly SALT_ROUNDS = 12;
+  private readonly SESSION_DURATION = 24 * 60 * 60 * 1000; // 24 hours
+
+  constructor() {
+    this.repository = new UserRepository();
+  }
+
+  // Security utilities
+  private hashPassword(password: string): Promise<string> {
+    return bcrypt.hash(password, this.SALT_ROUNDS);
+  }
+
+  private verifyPassword(password: string, hash: string): Promise<boolean> {
+    return bcrypt.compare(password, hash);
+  }
+
+  private hashIP(ip: string): string {
+    return bcrypt.hashSync(ip, 8);
+  }
+
+  private generateDeviceFingerprint(req: Request): string {
+    const userAgent = req.headers['user-agent'] || '';
+    const acceptLanguage = req.headers['accept-language'] || '';
+    const acceptEncoding = req.headers['accept-encoding'] || '';
+    
+    return bcrypt.hashSync(
+      `${userAgent.slice(0, 100)}:${acceptLanguage.slice(0, 50)}:${acceptEncoding.slice(0, 50)}`,
+      8
+    ).slice(0, 32);
+  }
+
+  private getClientIP(req: Request): string {
+    const forwarded = req.headers['x-forwarded-for'] as string;
+    return forwarded ? forwarded.split(',')[0].trim() : 
+           req.connection.remoteAddress || 
+           req.socket.remoteAddress || 
+           'unknown';
+  }
+
+  // Core user operations
+  async registerUser(userData: z.infer<typeof registerSchema>): Promise<{
+    user: User;
+    profile: UserProfile;
+  }> {
+    const validation = registerSchema.safeParse(userData);
+    if (!validation.success) {
+      throw new Error(`Validation failed: ${validation.error.errors.map(e => e.message).join(', ')}`);
+    }
+
+    const { firstName, lastName, email, password } = validation.data;
+
+    // Check if user exists
+    const existingUser = await this.repository.getUserByEmail(email);
+    if (existingUser) {
+      throw new Error('User already exists');
+    }
+
+    const passwordHash = await this.hashPassword(password);
+    
+    return await this.repository.createUser({
+      email,
+      passwordHash,
+      firstName,
+      lastName
+    });
+  }
+
+  async authenticateUser(
+    credentials: z.infer<typeof loginSchema>,
+    req: Request
+  ): Promise<{ user: User & { profile: UserProfile }; session: UserSession } | null> {
+    const validation = loginSchema.safeParse(credentials);
+    if (!validation.success) {
+      throw new Error('Invalid credentials format');
+    }
+
+    const { email, password } = validation.data;
+    const ipHash = this.hashIP(this.getClientIP(req));
+    const userAgent = req.headers['user-agent'] || '';
+
+    // Check recent failed attempts
+    const recentAttempts = await this.repository.getRecentLoginAttempts(email, ipHash);
+    const failedAttempts = recentAttempts.filter(a => !a.success).length;
+    
+    if (failedAttempts >= 5) {
+      await this.repository.recordLoginAttempt({
+        email,
+        ipAddressHash: ipHash,
+        success: false,
+        userAgent,
+        failureReason: 'rate_limited'
+      });
+      throw new Error('Too many failed attempts. Please try again later.');
+    }
+
+    const user = await this.repository.getUserByEmail(email);
+    if (!user) {
+      await this.repository.recordLoginAttempt({
+        email,
+        ipAddressHash: ipHash,
+        success: false,
+        userAgent,
+        failureReason: 'user_not_found'
+      });
+      return null;
+    }
+
+    // Check if account is locked
+    if (user.lockedUntil && user.lockedUntil > new Date()) {
+      await this.repository.recordLoginAttempt({
+        email,
+        ipAddressHash: ipHash,
+        success: false,
+        userAgent,
+        failureReason: 'account_locked'
+      });
+      throw new Error('Account is temporarily locked');
+    }
+
+    const isValidPassword = await this.verifyPassword(password, user.passwordHash);
+    if (!isValidPassword) {
+      await this.repository.incrementFailedLoginAttempts(user.id);
+      await this.repository.recordLoginAttempt({
+        email,
+        ipAddressHash: ipHash,
+        success: false,
+        userAgent,
+        failureReason: 'invalid_password'
+      });
+      return null;
+    }
+
+    // Successful login
+    await this.repository.updateUserLogin(user.id);
+    await this.repository.recordLoginAttempt({
+      email,
+      ipAddressHash: ipHash,
+      success: true,
+      userAgent
+    });
+
+    // Create session
+    const session = await this.repository.createSession({
+      userId: user.id,
+      deviceFingerprint: this.generateDeviceFingerprint(req),
+      ipAddressHash: ipHash,
+      userAgent,
+      expiresAt: new Date(Date.now() + this.SESSION_DURATION)
+    });
+
+    // Log activity
+    await this.repository.logActivity({
+      userId: user.id,
+      sessionId: session.id,
+      action: 'login',
+      ipAddressHash: ipHash,
+      userAgent,
+      success: true
+    });
+
+    return { user, session };
+  }
+
+  async updateUserProfile(
+    userId: string,
+    profileData: z.infer<typeof profileUpdateSchema>
+  ): Promise<void> {
+    const validation = profileUpdateSchema.safeParse(profileData);
+    if (!validation.success) {
+      throw new Error(`Validation failed: ${validation.error.errors.map(e => e.message).join(', ')}`);
+    }
+
+    await this.repository.updateProfile(userId, validation.data);
+  }
+
+  async validateSession(sessionId: string): Promise<UserSession | null> {
+    return await this.repository.validateSession(sessionId);
+  }
+
+  async logoutUser(sessionId: string, userId: string, req: Request): Promise<void> {
+    await this.repository.invalidateSession(sessionId);
+    
+    await this.repository.logActivity({
+      userId,
+      sessionId,
+      action: 'logout',
+      ipAddressHash: this.hashIP(this.getClientIP(req)),
+      userAgent: req.headers['user-agent'] || '',
+      success: true
+    });
+  }
+
+  async getUserStats(): Promise<any> {
+    return await this.repository.getUserStats();
+  }
+
+  async getLoginStats(days: number = 30): Promise<any> {
+    return await this.repository.getLoginStats(days);
+  }
+
+  async performMaintenance(): Promise<{
+    expiredSessions: number;
+    oldLogs: number;
+  }> {
+    const [expiredSessions, oldLogs] = await Promise.all([
+      this.repository.cleanupExpiredSessions(),
+      this.repository.cleanupOldActivityLogs()
+    ]);
+
+    return { expiredSessions, oldLogs };
+  }
+}
+
+// Export the service
+export const databaseUserService = new DatabaseUserService();
